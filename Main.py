@@ -4,6 +4,7 @@
 # All LEDs flash when in emergency mode
 # Maps opens when emergency mode is triggered
 # The push button enables/disables the monitoring 
+# When testing go to this line to change values for desired output: elif Bpm < 35 or Bpm > 400:
 
 from gpiozero import LED, Button
 import time
@@ -33,6 +34,7 @@ warning_issued = set()
 import webbrowser
 
 def open_maps_for_hospitals():
+    # Coordinates for ATU Galway
     lat = 53.2772
     lon = -9.0106
     url = f"https://www.google.com/maps/search/hospital/@{lat},{lon},15z" # url for google maps to search for nearest hospitals
@@ -81,7 +83,7 @@ if sensor.begin():
             sensor.get_heartbeat_SPO2()
             Bpm = sensor.heartbeat
 
-            if Bpm == -1:
+            if Bpm == -1: # -1 gets returned when it can't detect a heart rate 
                 print("No valid heart rate detected.")
                 ledG.off()
                 ledR.off()
