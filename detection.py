@@ -1,7 +1,16 @@
+from picamera2 import Picamera2
 import cv2
 import dlib
 import numpy as np
 from scipy.spatial import distance
+import time
+
+# Initialize Picamera2
+picam2 = Picamera2()
+config = picam2.create_preview_configuration(main={"format": "BGR888", "size": (640, 480)})
+picam2.configure(config)
+picam2.start()
+time.sleep(2)
 
 # Load dlib face detector and predictor
 detector = dlib.get_frontal_face_detector()
@@ -13,6 +22,17 @@ def eye_aspect_ratio(eye):
     B = distance.euclidean(eye[2], eye[4])
     C = distance.euclidean(eye[0], eye[3])
     return (A + B) / (2.0 * C)
+
+def lip_distance(shape):
+    top_lip = shape[50:53]
+    top_lip = np.concatenate((top_lip, shape[61:64]), axis=0)
+
+    bottom_lip = shape[56:59]
+    bottom_lip = np.concatenate((bottom_lip, shape[65:68]), axis=0)
+
+    top_mean = np.mean(top_lip[:, 1])
+    bottom_mean = np.mean(bottom_lip[:, 1])
+    return abs(top_mean - bottom_mean)
 
 # Eye landmark indices
 LEFT_EYE = list(range(42, 48))
@@ -28,18 +48,15 @@ model_points = np.array([
     (150.0, -150.0, -125.0)      # Right mouth corner
 ])
 
-# Start camera
-cap = cv2.VideoCapture(0)
-
 COUNTER = 0
-EAR_THRESH = 0.25
-EAR_FRAMES = 20
+EAR_THRESH = 0.30
+EAR_FRAMES = 10
+YAWN_THRESH = 30
 
+
+# Main loop
 while True:
-    ret, frame = cap.read()
-    if not ret:
-        break
-
+    frame = picam2.capture_array()
     frame = cv2.resize(frame, (640, 480))
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     faces = detector(gray)
@@ -60,12 +77,17 @@ while True:
         ear = (leftEAR + rightEAR) / 2.0
 
         if ear < EAR_THRESH:
-            COUNTER += 1
-            if COUNTER >= EAR_FRAMES:
                 cv2.putText(frame, "DROWSINESS ALERT", (10, 60),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
         else:
             COUNTER = 0
+            
+        # Yawn detection
+        mouth_open = lip_distance(shape)
+        if mouth_open > YAWN_THRESH:
+            cv2.putText(frame, "YAWNING ALERT", (10, 120),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
+
 
         # Head pose estimation
         image_points = np.array([
@@ -106,9 +128,10 @@ while True:
         for (x, y) in image_points.astype("int"):
             cv2.circle(frame, (x, y), 3, (0, 255, 255), -1)
 
-    cv2.imshow("Drowsiness + Distraction", frame)
+    cv2.imshow("Drowsiness + Distraction + Yawning", frame)
     if cv2.waitKey(1) & 0xFF == ord('q'):
         break
 
-cap.release()
+picam2.stop()
+
 cv2.destroyAllWindows()
