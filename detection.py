@@ -57,9 +57,10 @@ frame_size = (640, 480)
 try:
     from picamera2 import Picamera2
     picam2 = Picamera2()
-    cfg = picam2.create_preview_configuration(main={"format": "BGR888", "size": frame_size})
+    cfg = picam2.create_preview_configuration(main={"format": "RGB888", "size": frame_size})
     picam2.configure(cfg)
     picam2.start()
+    picam2.set_controls({"AwbEnable": True})  # ensure AWB runs
     time.sleep(1.0)
     use_picam2 = True
 except Exception as e:
