@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Driver Safety Dashboard</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+<body>
+  <!-- Toast warning banner -->
+  <div id="warning" class="warning hidden" role="alert" aria-live="assertive">
+    <span id="warning-text"></span>
+    <button id="warning-close" aria-label="Dismiss">×</button>
+  </div>
+
+  <div class="container">
+    <header class="header">
+      <h1>Driver Safety</h1>
+    </header>
+
+    <section class="cards">
+      <div class="card">
+        <h2>Heart Rate</h2>
+        <div class="hr-row">
+          <div class="hr-number"><span id="bpm">—</span> bpm</div>
+          <span id="hr-status" class="pill">—</span>
+        </div>
+        <canvas id="hrChart"></canvas>
+      </div>
+
+      <div class="card">
+        <h2>Vehicle</h2>
+        <div class="kv"><span>Speed</span><strong id="speed">—</strong></div>
+        <progress id="speedometer" value="100" max="100"></progress>
+        <div class="btn-row">
+          <button id="simulate-heart-attack">Simulate Emergency</button>
+          <button id="reset-heart-attack" class="secondary">Reset</button>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>Driver Status</h2>
+        <ul class="statuslist">
+          <li>Drowsiness: <strong id="drowsiness">—</strong></li>
+          <li>Yawning: <strong id="yawning">—</strong></li>
+          <li>Distraction: <strong id="distraction">—</strong></li>
+        </ul>
+      </div>
+    </section>
+  </div>
+
+  <!-- Load your working JS last -->
+  <script src="{{ url_for('static', filename='script.js') }}"></script>
+</body>
+</html>
