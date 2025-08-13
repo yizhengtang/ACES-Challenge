@@ -8,6 +8,7 @@ import csv
 import os
 from datetime import datetime
 import pygame  # sounds
+import json   # <-- ADDED
 
 # ---------- Speed knobs ----------
 cv2.setUseOptimized(True)
@@ -26,6 +27,22 @@ DISTRACT_SOUND = "/home/aces2025/ProjectMain/ACES-Challenge/distraction.wav"
 
 DNN_PROTO = "/home/aces2025/ProjectMain/ACES-Challenge/deploy.prototxt"
 DNN_MODEL = "/home/aces2025/ProjectMain/ACES-Challenge/res10_300x300_ssd_iter_140000.caffemodel"
+
+# ---------- Driver status handoff to dashboard (ADDED) ----------
+DRIVER_STATUS_FILE = "/tmp/driver_status.json"
+
+def write_driver_status(drowsy=False, yawn=False, distract=False):
+    """Write one compact JSON snapshot the dashboard can poll."""
+    try:
+        with open(DRIVER_STATUS_FILE, "w") as f:
+            json.dump({
+                "drowsiness": bool(drowsy),
+                "yawning": bool(yawn),
+                "distraction": bool(distract),
+                "ts": time.time()
+            }, f)
+    except Exception:
+        pass
 
 # ---------- Models ----------
 detector_hog = dlib.get_frontal_face_detector()
@@ -76,6 +93,7 @@ def log_event(alert_type, value):
         csv.writer(f).writerow([datetime.now().strftime("%Y-%m-%d %H:%M:%S"), alert_type, f"{value:.3f}"])
 
 # ---------- Sounds ----------
+sound_last = {}
 def play_sound(path, rate_limit_ms=2000):
     now = int(time.time() * 1000)
     last = sound_last.get(path, 0)
@@ -195,7 +213,6 @@ except Exception as e:
         raise SystemExit
 
 # ---------- Pygame ----------
-sound_last = {}
 try:
     pygame.mixer.init(frequency=44100, size=-16, channels=2, buffer=512)
     print("Pygame mixer initialized.")
@@ -235,6 +252,9 @@ draw_boxes = True
 clean_view = False
 
 frame_idx = 0
+
+# write neutral once at start (so dashboard doesn't show stale)
+write_driver_status(False, False, False)
 
 # ---------- Main loop ----------
 try:
@@ -284,6 +304,11 @@ try:
             if last_rect and (now_ms - last_seen_ts_ms) < grace_ms:
                 rect = last_rect
 
+        # flag alerts this frame (so we write JSON once)
+        drowsy_flag = False
+        yawn_flag = False
+        distract_flag = False
+
         # ----- Calibration banner -----
         if ear_thresh is None or yawn_thresh is None:
             cv2.putText(frame, "CALIBRATING... Look forward, eyes OPEN, mouth relaxed",
@@ -297,6 +322,8 @@ try:
         if rect is None:
             cv2.putText(frame, "FACE NOT DETECTED", (10, 80),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+            # No face → write neutral so UI shows "No"
+            write_driver_status(False, False, False)
             alert_mgr.draw(frame)
             cv2.putText(frame, "Press 'v' clean view, 'l' landmarks, 'b' boxes, 'c' recalib, 'q' quit",
                         (10, frame.shape[0]-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200,200,200), 1)
@@ -378,13 +405,12 @@ try:
             else:
                 closed_frames = 0
 
-            # Drowsiness triggers:
-            # A) sustained closure (frames)
-            # B) high PERCLOS over window (more robust)
+            # Drowsiness triggers
             if (closed_frames >= 5) or (perclos >= 0.40):
                 alert_mgr.trigger("Drowsy", "DROWSINESS ALERT")
                 log_event("Drowsy", float(ear_ema))
                 play_sound(DROWSY_SOUND)
+                drowsy_flag = True
                 # reset a bit so it won't spam
                 closed_frames = 0
                 perclos_events.clear()
@@ -394,6 +420,7 @@ try:
                 alert_mgr.trigger("Yawn", "YAWNING ALERT")
                 log_event("Yawn", float(mouth_ratio))
                 play_sound(YAWN_SOUND)
+                yawn_flag = True
 
             # Distraction: yaw deviation
             deviation = (yaw_avg - yaw_center)
@@ -403,6 +430,7 @@ try:
                 alert_mgr.trigger("Distraction", f"DISTRACTION ALERT! ({direction})")
                 log_event("Distraction", float(deviation))
                 play_sound(DISTRACT_SOUND)
+                distract_flag = True
 
         # Footer + alerts
         alert_mgr.draw(frame)
@@ -410,6 +438,16 @@ try:
             cv2.putText(frame, "Press 'v' clean view, 'l' landmarks, 'b' boxes, 'c' recalib, 'q' quit",
                         (10, frame.shape[0]-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200,200,200), 1)
 
+        # ---- WRITE STATUS ONCE PER FRAME (ADDED) ----
+        # If any flag is true, write that. If none, write neutral.
+        if drowsy_flag or yawn_flag or distract_flag:
+            write_driver_status(drowsy_flag, yawn_flag, distract_flag)
+        else:
+            # If nothing triggered and no on-screen (time-held) alerts remain, go neutral
+            if alert_mgr.active == {}:
+                write_driver_status(False, False, False)
+
+        # Display & keys
         cv2.imshow("Driver Monitor (DNN + Tracker, smooth)", frame)
         key = cv2.waitKey(1) & 0xFF
         if key == ord('q'):
@@ -434,3 +472,5 @@ finally:
     except Exception:
         pass
     cv2.destroyAllWindows()
+    # On exit, write neutral so dashboard clears
+    write_driver_status(False, False, False)
