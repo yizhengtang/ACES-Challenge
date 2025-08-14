@@ -33,7 +33,16 @@ def read_external_hazard():
 # ---- Motor pins (change if yours differ)
 ENA, IN1, IN2 = 12, 5, 24    # ENA=GPIO12(PWM), IN1=GPIO5, IN2=GPIO24
 PWM_FREQ = 1000
-RAMP_STEP, RAMP_INTERVAL = 5, 0.20
+
+# Separate ramp profiles
+RAMP_UP_STEP,        RAMP_UP_INTERVAL        = 4, 0.15   # gentler startup after reset
+RAMP_DOWN_STEP_NORM, RAMP_DOWN_INTERVAL_NORM = 3, 0.24   # normal gentle slowing
+
+# Asymptotic hazard slowdown (easing)
+HAZARD_EASE_FACTOR     = 0.035  # ~3.5% of current duty per step (slower drop)
+HAZARD_EASE_MIN_STEP   = 1      # never drop slower than 1%
+HAZARD_EASE_INTERVAL   = 0.45   # slightly longer pause between eased steps
+
 NORMAL_TARGET, HAZARD_TARGET = 100, 0
 
 def motor_setup():
@@ -51,7 +60,9 @@ def motor_cleanup(pwm):
     GPIO.cleanup()
 
 # ---- LEDs & Button
-ledR = LED(17); ledG = LED(27); ledY = LED(23)
+ledR = LED(17)  # Red
+ledG = LED(27)  # Green
+ledY = LED(23)  # Yellow
 button = Button(18, hold_time=3)
 
 # ---- Heart sensor
@@ -62,14 +73,24 @@ emergency_mode = False
 warning_intervals = [10, 20]
 warning_issued = set()
 
+# --- Internal emergency: flash all LEDs
 _last_flash, _flash_period = 0.5, 0.5
 def emergency_flash_tick():
-    # Only for *internal* emergency_mode (not simulate)
     global _last_flash
     now = time.time()
     if now - _last_flash >= _flash_period:
         ledR.toggle(); ledG.toggle(); ledY.toggle()
         _last_flash = now
+
+# --- Simulate-hazard (external) LED flicker: **RED** blink, faster
+_hazard_flash_last = 0.0
+_HAZARD_FLASH_PERIOD = 0.25  # seconds
+def hazard_flash_tick():
+    global _hazard_flash_last
+    now = time.time()
+    if now - _hazard_flash_last >= _HAZARD_FLASH_PERIOD:
+        ledR.toggle()  # RED flicker
+        _hazard_flash_last = now
 
 def open_maps_for_hospitals():
     lat, lon = 53.2772, -9.0106
@@ -82,34 +103,58 @@ def toggle_monitoring():
     monitoring_enabled = not monitoring_enabled
     if not monitoring_enabled:
         ledY.on(); ledR.off(); ledG.off(); write_hr(0, "Disabled")
+        print("[MON] Monitoring disabled")
     else:
         ledY.off()
+        print("[MON] Monitoring enabled")
 
 def reset_emergency():
     global emergency_mode, monitoring_enabled, abnormal_counter
     emergency_mode = False; monitoring_enabled = True
     abnormal_counter = 0; warning_issued.clear()
     ledR.off(); ledG.off(); ledY.off()
+    print("[EMERGENCY] Cleared via long-press; resuming live sensor.")
 
 button.when_pressed = toggle_monitoring
 button.when_held    = reset_emergency
+
+def _ramp_to(pwm, start, target, step, interval, hazard=False):
+    duty = start
+    write_speed(duty, hazard=hazard)
+    try: pwm.ChangeDutyCycle(duty)
+    except Exception: pass
+    while duty != target:
+        time.sleep(interval)
+        if target > duty:
+            duty = min(target, duty + step)
+        else:
+            duty = max(target, duty - step)
+        try: pwm.ChangeDutyCycle(duty)
+        except Exception: pass
+        write_speed(duty, hazard=hazard)
+    return duty
 
 def main():
     global monitoring_enabled, abnormal_counter, emergency_mode
 
     # ---- Motor
     pwm = motor_setup()
-    cur_duty, target_duty = 100, NORMAL_TARGET    # start car running
-    pwm.ChangeDutyCycle(cur_duty)                  # IMPORTANT: actually apply 100% now
+    # Start gently from 0% to 100%
+    cur_duty = _ramp_to(pwm, 0, 100, RAMP_UP_STEP, RAMP_UP_INTERVAL, hazard=False)
+    target_duty = NORMAL_TARGET
+    print(f"[MOTOR] Ramped up to {cur_duty}% duty")
     write_speed(cur_duty, hazard=False)
 
     # ---- Sensor
     sensor_ok = sensor.begin()
     if sensor_ok:
-        try: sensor.sensor_start_collect(); print("Sensor connected")
-        except Exception: print("Sensor collect start issue; continuing.")
+        try:
+            sensor.sensor_start_collect()
+            print("[SENSOR] Connected and collecting")
+        except Exception:
+            print("[SENSOR] Collect start issue; continuing.")
     else:
-        print("Sensor not found")
+        print("[SENSOR] Not found")
 
     last_motor_tick = 0.0
     last_sensor = 0.0
@@ -117,6 +162,8 @@ def main():
     hazard_hr = last_display_bpm
     HAZARD_HR_TARGET = 160
     HAZARD_HR_STEP   = 5
+
+    prev_hazard_active = False  # for edge detection
 
     try:
         while True:
@@ -126,25 +173,58 @@ def main():
             ext_hazard = read_external_hazard()
             hazard_active = ext_hazard or emergency_mode
 
+            if hazard_active and not prev_hazard_active:
+                print("[HAZARD] Activated (Simulate or Internal).")
+            if not hazard_active and prev_hazard_active:
+                print("[HAZARD] Cleared.")
+                if monitoring_enabled:
+                    ledR.off()
+                # resume live HR cleanly after a simulated hazard
+                monitoring_enabled = True
+                emergency_mode = False
+                abnormal_counter = 0
+                warning_issued.clear()
+
+            prev_hazard_active = hazard_active
+
             # ---- Motor ramp + write speed
             target_duty = HAZARD_TARGET if hazard_active else NORMAL_TARGET
-            if now - last_motor_tick >= RAMP_INTERVAL:
-                if cur_duty < target_duty: cur_duty = min(cur_duty + RAMP_STEP, target_duty)
-                elif cur_duty > target_duty: cur_duty = max(cur_duty - RAMP_STEP, target_duty)
-                try: pwm.ChangeDutyCycle(cur_duty)
-                except Exception: pass
+
+            if cur_duty < target_duty:
+                step = RAMP_UP_STEP
+                interval = RAMP_UP_INTERVAL
+                next_duty = min(cur_duty + step, target_duty)
+            elif cur_duty > target_duty:
+                if hazard_active:
+                    step = max(HAZARD_EASE_MIN_STEP, int(round(cur_duty * HAZARD_EASE_FACTOR)))
+                    interval = HAZARD_EASE_INTERVAL
+                else:
+                    step = RAMP_DOWN_STEP_NORM
+                    interval = RAMP_DOWN_INTERVAL_NORM
+                next_duty = max(cur_duty - step, target_duty)
+            else:
+                interval = None
+                next_duty = cur_duty
+
+            if interval is not None and (now - last_motor_tick) >= interval:
+                cur_duty = next_duty
+                try:
+                    pwm.ChangeDutyCycle(cur_duty)
+                except Exception:
+                    pass
                 last_motor_tick = now
                 write_speed(cur_duty, hazard=hazard_active)
 
-            # Flash LEDs for *internal* emergency only (simulate keeps them steady)
+            # ---- LED policies
             if emergency_mode:
                 emergency_flash_tick()
+            elif ext_hazard:
+                hazard_flash_tick()
 
             # ---- Heart rate read/publish (~1 Hz)
             if now - last_sensor >= 1.0:
                 last_sensor = now
 
-                # Read raw sensor if monitoring + sensor ok
                 Bpm = -1
                 if monitoring_enabled and sensor_ok:
                     try:
@@ -153,22 +233,22 @@ def main():
                     except Exception:
                         Bpm = -1
 
-                # Decide what to display
                 if hazard_active:
-                    # Simulate heart attack: spike HR upwards and mark Abnormal
                     base = Bpm if (Bpm != -1 and Bpm > 0) else last_display_bpm
                     hazard_hr = min(HAZARD_HR_TARGET, max(base, hazard_hr + HAZARD_HR_STEP))
                     display_bpm = int(hazard_hr)
                     display_status = "Abnormal"
+                    print(f"[HR] Simulated hazard BPM={display_bpm} (status={display_status})")
                 else:
-                    # Normal: use sensor (or hold steady if no read)
                     if Bpm == -1:
                         display_bpm = max(55, min(110, int(last_display_bpm + random.randint(-2,2))))
                         display_status = "NoRead"
+                        print(f"[HR] NoRead from sensor; showing fallback {display_bpm} bpm")
                     else:
                         display_bpm = int(Bpm)
                         display_status = "Normal" if display_bpm < 100 else "Abnormal"
-                        hazard_hr = display_bpm  # reset baseline for next simulate/emergency
+                        hazard_hr = display_bpm
+                        print(f"[HR] Sensor BPM={display_bpm} (status={display_status})")
 
                 write_hr(display_bpm, display_status)
                 last_display_bpm = display_bpm
