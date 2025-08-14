@@ -8,15 +8,15 @@ import csv
 import os
 from datetime import datetime
 import pygame  # sounds
-import json   # <-- ADDED
+import json
 
 # ---------- Speed knobs ----------
 cv2.setUseOptimized(True)
-cv2.setNumThreads(2)            # 2–3 is good on Pi 5
-PROCESS_SIZE = (640, 480)       # try (512, 384) if you still see lag
+cv2.setNumThreads(2)                 # 2–3 is good on Pi 5
+PROCESS_SIZE = (640, 480)
 
-DETECT_EVERY = 12               # run heavy DNN every N frames when tracker is good
-REDETECT_ON_BAD_QUALITY = 6.0   # if tracker quality < this, force re-detect
+DETECT_EVERY = 12                    # baseline cadence for heavy detect
+REDETECT_ON_BAD_QUALITY = 6.0        # tracker quality threshold
 
 # ---------- Paths ----------
 PREDICTOR_PATH = "/home/aces2025/ProjectMain/ACES-Challenge/shape_predictor_68_face_landmarks.dat"
@@ -28,7 +28,7 @@ DISTRACT_SOUND = "/home/aces2025/ProjectMain/ACES-Challenge/distraction.wav"
 DNN_PROTO = "/home/aces2025/ProjectMain/ACES-Challenge/deploy.prototxt"
 DNN_MODEL = "/home/aces2025/ProjectMain/ACES-Challenge/res10_300x300_ssd_iter_140000.caffemodel"
 
-# ---------- Driver status handoff to dashboard (ADDED) ----------
+# ---------- Driver status handoff to dashboard ----------
 DRIVER_STATUS_FILE = "/tmp/driver_status.json"
 
 def write_driver_status(drowsy=False, yawn=False, distract=False):
@@ -56,19 +56,11 @@ try:
     print("OpenCV DNN face detector loaded.")
 except Exception as e:
     print(f"[INFO] Could not load DNN face detector: {e}")
+    print("[INFO] Using HOG detector only (no DNN).")
 
-# ---------- Utils ----------
+# ---------- Landmark regions / utils ----------
 LEFT_EYE  = list(range(42, 48))
 RIGHT_EYE = list(range(36, 42))
-
-model_points = np.array([
-    (0.0,   0.0,    0.0),
-    (0.0,  -330.0, -65.0),
-    (-225.0, 170.0, -135.0),
-    (225.0, 170.0, -135.0),
-    (-150.0,-150.0, -125.0),
-    (150.0,-150.0, -125.0)
-], dtype="double")
 
 def eye_aspect_ratio(eye_pts):
     A = distance.euclidean(eye_pts[1], eye_pts[5])
@@ -77,9 +69,11 @@ def eye_aspect_ratio(eye_pts):
     return (A + B) / (2.0 * C)
 
 def mouth_opening_ratio(shape_np):
+    # top lip pts: 50-52 + 61-63 ; bottom lip pts: 56-58 + 65-67
     top = np.concatenate((shape_np[50:53], shape_np[61:64]), axis=0)
     bottom = np.concatenate((shape_np[56:59], shape_np[65:68]), axis=0)
     mouth_open_px = abs(np.mean(top[:, 1]) - np.mean(bottom[:, 1]))
+    # normalize by face vertical size (chin to nose-root) to be scale-invariant
     face_scale = np.linalg.norm(shape_np[8] - shape_np[30]) + 1e-6
     return mouth_open_px / face_scale
 
@@ -89,37 +83,50 @@ def normalize_gray(gray):
     return clahe.apply(gray)
 
 def log_event(alert_type, value):
-    with open(LOG_FILE, mode="a", newline="") as f:
-        csv.writer(f).writerow([datetime.now().strftime("%Y-%m-%d %H:%M:%S"), alert_type, f"{value:.3f}"])
-
-# ---------- Sounds ----------
-sound_last = {}
-def play_sound(path, rate_limit_ms=2000):
-    now = int(time.time() * 1000)
-    last = sound_last.get(path, 0)
-    if now - last < rate_limit_ms:
-        return
     try:
-        if pygame.mixer.get_init() is not None:
-            pygame.mixer.music.load(path)
-            pygame.mixer.music.play()
-            sound_last[path] = now
+        with open(LOG_FILE, mode="a", newline="") as f:
+            csv.writer(f).writerow([datetime.now().strftime("%Y-%m-%d %H:%M:%S"), alert_type, f"{value:.3f}"])
+    except Exception:
+        pass
+
+# ---------- Sounds (preloaded + rate-limited, no stutter) ----------
+SND = {}
+_sound_last = {}
+def _sound_can_play(key, rate_limit_ms=2000):
+    now = int(time.time() * 1000)
+    last = _sound_last.get(key, 0)
+    if now - last < rate_limit_ms:
+        return False
+    _sound_last[key] = now
+    return True
+
+def play_sound_key(key, rate_limit_ms=2000):
+    try:
+        if SND.get(key) and _sound_can_play(key, rate_limit_ms):
+            SND[key].play()
     except pygame.error:
         pass
 
-# ---------- Alert manager (keeps messages visible) ----------
+# ---------- Alert manager (keeps messages visible, throttled draw) ----------
 class AlertManager:
-    def __init__(self, hold_ms=2500):
+    def __init__(self, hold_ms=4000):  # longer hold for visibility
         self.hold_ms = hold_ms
         self.active = {}  # name -> (message, expiry_ms)
+        self._last_draw = 0.0  # throttle overlay draws to ~15 fps
 
     def trigger(self, name, message):
         expiry = int(time.time() * 1000) + self.hold_ms
         self.active[name] = (message, expiry)
 
     def draw(self, frame):
+        # Throttle drawing to save CPU on Pi
+        now_s = time.time()
+        if now_s - self._last_draw < (1.0/15.0):
+            return
+        self._last_draw = now_s
+
         # purge expired, draw remaining stacked
-        now = int(time.time() * 1000)
+        now = int(now_s * 1000)
         to_show = []
         for k, (msg, exp) in list(self.active.items()):
             if now > exp:
@@ -156,17 +163,27 @@ def detect_faces_dnn(frame_bgr):
                                     min(w - 1, x2 + pad), min(h - 1, y2 + pad)))
     return rects
 
+detector_hog_fallback = dlib.get_frontal_face_detector()
+
 def detect_faces(gray, frame_bgr):
     rects = detect_faces_dnn(frame_bgr)
     if not rects:
-        rects = detector_hog(normalize_gray(gray), 0)
+        rects = detector_hog_fallback(normalize_gray(gray), 0)
     return rects
 
-# ---------- Pose ----------
+# ---------- Pose (yaw) ----------
+model_points = np.array([
+    (0.0,   0.0,    0.0),
+    (0.0,  -330.0, -65.0),
+    (-225.0, 170.0, -135.0),
+    (225.0, 170.0, -135.0),
+    (-150.0,-150.0, -125.0),
+    (150.0,-150.0, -125.0)
+], dtype="double")
+
 def compute_yaw(shape_np, frame):
-    image_points = np.array([
-        shape_np[30], shape_np[8], shape_np[36], shape_np[45], shape_np[48], shape_np[54]
-    ], dtype="double")
+    image_points = np.array([shape_np[30], shape_np[8], shape_np[36], shape_np[45], shape_np[48], shape_np[54]],
+                            dtype="double")
     focal_length = frame.shape[1]
     center = (frame.shape[1]/2.0, frame.shape[0]/2.0)
     camera_matrix = np.array([[focal_length, 0, center[0]],
@@ -179,29 +196,32 @@ def compute_yaw(shape_np, frame):
     rmat, _ = cv2.Rodrigues(rvec)
     proj = np.hstack((rmat, tvec))
     _, _, _, _, _, _, euler = cv2.decomposeProjectionMatrix(proj)
-    return float(euler[1,0])
+    return float(euler[1,0])  # yaw (deg)
 
 # ---------- CSV header ----------
 if not os.path.exists(LOG_FILE):
-    with open(LOG_FILE, mode="w", newline="") as f:
-        csv.writer(f).writerow(["Timestamp", "Alert Type", "Value"])
+    try:
+        with open(LOG_FILE, mode="w", newline="") as f:
+            csv.writer(f).writerow(["Timestamp", "Alert Type", "Value"])
+    except Exception:
+        pass
 
 # ---------- Camera ----------
 use_picam2 = False
 try:
     from picamera2 import Picamera2
     picam2 = Picamera2()
-    cfg = picam2.create_preview_configuration(
-        main={"format": "BGR888", "size": PROCESS_SIZE},
-        buffer_count=2
-    )
+    cfg = picam2.create_preview_configuration(main={"format": "BGR888", "size": PROCESS_SIZE}, buffer_count=2)
     picam2.configure(cfg)
     try:
         picam2.set_controls({"FrameRate": 30})
     except Exception:
         pass
     picam2.start()
+    # warm-up to avoid low-exposure first frame
     time.sleep(0.4)
+    for _ in range(2):
+        _ = picam2.capture_array()
     use_picam2 = True
 except Exception as e:
     print(f"[INFO] Picamera2 not used ({e}). Falling back to OpenCV VideoCapture.")
@@ -215,6 +235,14 @@ except Exception as e:
 # ---------- Pygame ----------
 try:
     pygame.mixer.init(frequency=44100, size=-16, channels=2, buffer=512)
+    # Preload short WAVs into channel-friendly Sound objects
+    for key, path in (("d", DROWSY_SOUND), ("y", YAWN_SOUND), ("x", DISTRACT_SOUND)):
+        try:
+            snd = pygame.mixer.Sound(path)
+            snd.set_volume(0.9)
+            SND[key] = snd
+        except pygame.error:
+            SND[key] = None
     print("Pygame mixer initialized.")
 except pygame.error as e:
     print(f"Audio init error: {e}")
@@ -222,9 +250,9 @@ except pygame.error as e:
 # ---------- States ----------
 yaw_history = deque(maxlen=9)
 ear_ema = None
-EMA_ALPHA = 0.25               # EAR smoothing (0.25 works well)
+EMA_ALPHA = 0.25
 closed_frames = 0
-alert_mgr = AlertManager(hold_ms=2500)  # keep alerts visible
+alert_mgr = AlertManager(hold_ms=4000)  # keep alerts visible a bit longer
 
 # Calibration
 calib_time_sec = 7
@@ -233,7 +261,7 @@ calib_ears, calib_mouths, calib_yaws = [], [], []
 ear_thresh = None
 yawn_thresh = None
 yaw_center = 0.0
-yaw_thresh_deg = 25.0
+yaw_thresh_deg = 25.0  # distraction threshold
 
 # PERCLOS (eye closure percentage over window)
 PERCLOS_WIN_SEC = 3.0
@@ -244,37 +272,50 @@ tracker = dlib.correlation_tracker()
 tracker_active = False
 last_rect = None
 last_seen_ts_ms = 0
-grace_ms = 700
+grace_ms = 1200  # keep last rect for longer if detect blips (was 700)
 
 # Draw toggles
 draw_landmarks = False
 draw_boxes = True
-clean_view = False
+clean_view = False   # overlays off by default for speed
 
 frame_idx = 0
 
 # write neutral once at start (so dashboard doesn't show stale)
 write_driver_status(False, False, False)
 
-# ---------- Main loop ----------
+# FPS tracker for adaptive heavy-detect cadence
+fps_hist = deque(maxlen=15)
+_last_t = time.time()
+
 try:
     while True:
+        # ----- Grab frame -----
         if use_picam2:
             frame = picam2.capture_array()
         else:
             ok, frame = cap.read()
-            if not ok: break
+            if not ok:
+                break
 
         frame_idx += 1
         if frame.shape[1] != PROCESS_SIZE[0] or frame.shape[0] != PROCESS_SIZE[1]:
             frame = cv2.resize(frame, PROCESS_SIZE, interpolation=cv2.INTER_AREA)
 
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        now_ms = int(time.time() * 1000)
 
-        # --- Detection + tracking strategy ---
+        # ----- FPS & adaptive cadence -----
+        now_t = time.time()
+        dt = now_t - _last_t
+        _last_t = now_t
+        if dt > 0:
+            fps_hist.append(1.0 / dt)
+        fps = sum(fps_hist)/len(fps_hist) if fps_hist else 0.0
+        adaptive_detect_every = DETECT_EVERY + (3 if fps < 18 else 0)
+
+        # ----- Detection + tracking strategy -----
         need_heavy = False
-        if not tracker_active or (frame_idx % DETECT_EVERY == 0):
+        if not tracker_active or (frame_idx % adaptive_detect_every == 0):
             need_heavy = True
 
         rect = None
@@ -282,7 +323,8 @@ try:
             quality = tracker.update(frame)
             if quality >= REDETECT_ON_BAD_QUALITY:
                 pos = tracker.get_position()
-                rect = dlib.rectangle(int(pos.left()), int(pos.top()), int(pos.right()), int(pos.bottom()))
+                rect = dlib.rectangle(int(pos.left()), int(pos.top()),
+                                      int(pos.right()), int(pos.bottom()))
             else:
                 tracker_active = False
                 need_heavy = True
@@ -296,6 +338,8 @@ try:
             else:
                 rect = None
 
+        now_ms = int(time.time() * 1000)
+
         # grace window if detection blips
         if rect is not None:
             last_rect = rect
@@ -304,7 +348,7 @@ try:
             if last_rect and (now_ms - last_seen_ts_ms) < grace_ms:
                 rect = last_rect
 
-        # flag alerts this frame (so we write JSON once)
+        # flags for this frame
         drowsy_flag = False
         yawn_flag = False
         distract_flag = False
@@ -329,14 +373,18 @@ try:
                         (10, frame.shape[0]-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200,200,200), 1)
             cv2.imshow("Driver Monitor (DNN + Tracker, smooth)", frame)
             key = cv2.waitKey(1) & 0xFF
-            if key == ord('q'): break
+            if key == ord('q'):
+                break
             if key == ord('c'):
                 calib_start = time.time()
                 calib_ears.clear(); calib_mouths.clear(); calib_yaws.clear()
                 ear_thresh = None; yawn_thresh = None; yaw_center = 0.0
-            if key == ord('l'): draw_landmarks = not draw_landmarks
-            if key == ord('b'): draw_boxes = not draw_boxes
-            if key == ord('v'): clean_view = not clean_view
+            if key == ord('l'):
+                draw_landmarks = not draw_landmarks
+            if key == ord('b'):
+                draw_boxes = not draw_boxes
+            if key == ord('v'):
+                clean_view = not clean_view
             continue
 
         # Optional box
@@ -357,7 +405,12 @@ try:
         left_eye  = shape_np[LEFT_EYE]
         right_eye = shape_np[RIGHT_EYE]
         ear_raw = (eye_aspect_ratio(left_eye) + eye_aspect_ratio(right_eye)) / 2.0
-        ear_ema = ear_raw if ear_ema is None else (EMA_ALPHA * ear_raw + (1-EMA_ALPHA) * ear_ema)
+        # safer update (no accidental scoping issues)
+        if ear_ema is None:
+            ear_ema = ear_raw
+        else:
+            ear_ema = EMA_ALPHA * ear_raw + (1 - EMA_ALPHA) * ear_ema
+
         mouth_ratio = mouth_opening_ratio(shape_np)
         yaw_deg = compute_yaw(shape_np, frame)
         if yaw_deg is not None:
@@ -369,37 +422,35 @@ try:
             cv2.putText(frame, f"Yaw: {yaw_avg:+.1f} deg (center {yaw_center:+.1f})",
                         (10, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200,200,200), 1)
 
-        # Calibration samples
+        # ----- Calibration samples / finalize -----
         if ear_thresh is None or yawn_thresh is None:
             if (time.time() - calib_start) <= calib_time_sec:
-                calib_ears.append(ear_ema)
-                calib_mouths.append(mouth_ratio)
+                if ear_ema is not None:
+                    calib_ears.append(float(ear_ema))
+                calib_mouths.append(float(mouth_ratio))
                 if yaw_deg is not None:
-                    calib_yaws.append(yaw_deg)
+                    calib_yaws.append(float(yaw_deg))
             else:
                 if calib_ears and calib_mouths:
                     ear_mean, ear_std = np.mean(calib_ears), np.std(calib_ears)
                     mouth_mean, mouth_std = np.mean(calib_mouths), np.std(calib_mouths)
+                    # Conservative thresholds: 30% drop in EAR or 2σ
                     ear_thresh = min(ear_mean * 0.70, ear_mean - 2.0 * ear_std)
+                    # Big mouth opening: 60% above mean or 3σ
                     yawn_thresh = max(mouth_mean * 1.60, mouth_mean + 3.0 * mouth_std)
                     yaw_center = np.median(calib_yaws) if calib_yaws else 0.0
 
-        # After calibration: detection logic
+        # ----- Detection logic (after calibration) -----
         if ear_thresh is not None and yawn_thresh is not None:
-            # --- PERCLOS over last N seconds ---
+            # PERCLOS over last N seconds
             closed_now = 1 if ear_ema < ear_thresh else 0
             perclos_events.append((now_ms, closed_now))
-            # drop old
             cutoff = now_ms - int(PERCLOS_WIN_SEC * 1000)
             while perclos_events and perclos_events[0][0] < cutoff:
                 perclos_events.popleft()
-            # percentage closed
-            if perclos_events:
-                perclos = sum(v for _, v in perclos_events) / len(perclos_events)
-            else:
-                perclos = 0.0
+            perclos = (sum(v for _, v in perclos_events) / len(perclos_events)) if perclos_events else 0.0
 
-            # Keep consecutive frames logic as secondary
+            # Consecutive closed frames (backup to PERCLOS)
             if closed_now:
                 closed_frames += 1
             else:
@@ -409,7 +460,7 @@ try:
             if (closed_frames >= 5) or (perclos >= 0.40):
                 alert_mgr.trigger("Drowsy", "DROWSINESS ALERT")
                 log_event("Drowsy", float(ear_ema))
-                play_sound(DROWSY_SOUND)
+                play_sound_key("d")
                 drowsy_flag = True
                 # reset a bit so it won't spam
                 closed_frames = 0
@@ -419,35 +470,34 @@ try:
             if mouth_ratio > yawn_thresh:
                 alert_mgr.trigger("Yawn", "YAWNING ALERT")
                 log_event("Yawn", float(mouth_ratio))
-                play_sound(YAWN_SOUND)
+                play_sound_key("y")
                 yawn_flag = True
 
-            # Distraction: yaw deviation
+            # Distraction: yaw deviation from center
             deviation = (yaw_avg - yaw_center)
             abs_dev = abs(deviation)
             direction = "RIGHT" if deviation > 0 else "LEFT"
             if abs_dev > yaw_thresh_deg:
                 alert_mgr.trigger("Distraction", f"DISTRACTION ALERT! ({direction})")
                 log_event("Distraction", float(deviation))
-                play_sound(DISTRACT_SOUND)
+                play_sound_key("x")
                 distract_flag = True
 
-        # Footer + alerts
+        # ----- Footer + draw alerts -----
         alert_mgr.draw(frame)
         if not clean_view:
             cv2.putText(frame, "Press 'v' clean view, 'l' landmarks, 'b' boxes, 'c' recalib, 'q' quit",
                         (10, frame.shape[0]-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200,200,200), 1)
 
-        # ---- WRITE STATUS ONCE PER FRAME (ADDED) ----
-        # If any flag is true, write that. If none, write neutral.
+        # ---- WRITE STATUS ONCE PER FRAME ----
+        # If any flag is true, write that. If none, go neutral when no active on-screen alerts remain.
         if drowsy_flag or yawn_flag or distract_flag:
             write_driver_status(drowsy_flag, yawn_flag, distract_flag)
         else:
-            # If nothing triggered and no on-screen (time-held) alerts remain, go neutral
             if alert_mgr.active == {}:
                 write_driver_status(False, False, False)
 
-        # Display & keys
+        # ----- Display & keys -----
         cv2.imshow("Driver Monitor (DNN + Tracker, smooth)", frame)
         key = cv2.waitKey(1) & 0xFF
         if key == ord('q'):
