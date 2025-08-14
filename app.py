@@ -20,6 +20,7 @@ def write_motor_cmd(hazard: bool):
         json.dump(payload, tf); tmp = tf.name
     os.replace(tmp, MOTOR_CMD_FILE)
 
+# Server-side HR history (for the chart)
 trend = deque(maxlen=30)
 _last_bpm = 75
 
@@ -69,8 +70,14 @@ def home():
 @app.route("/heart_rate")
 def heart_rate():
     bpm, status = read_hr()
-    trend.append(bpm)
-    return jsonify({"bpm": bpm, "status": status, "series": list(trend)})
+    # Only push REAL data onto the graph (skip "NoRead" frames)
+    if status != "NoRead":
+        trend.append(bpm)
+    return jsonify({
+        "bpm": bpm,
+        "status": status,
+        "series": list(trend) if len(trend) > 0 else []
+    })
 
 @app.route("/car_status")
 def car_status():
